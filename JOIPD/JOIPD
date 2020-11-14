@@ -11,12 +11,13 @@ from typing import List
 import requests
 from docopt import docopt
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 VERSION = "1.0.0"
 CLI = f"""JOIP Archiver
 
 Usage:
-  {sys.argv[0]} <link> [-o | --output <filename>] [--verbose] [-n | --no-download]
+  {sys.argv[0]} <link> [-o | --output <filename>] [--quiet | --verbose] [-d | --download <folder>]
   {sys.argv[0]} (-h | --help)
   {sys.argv[0]} (-v | --version)
 
@@ -24,8 +25,9 @@ Options:
   -h --help         Show this screen.
   -v --version      Show version.
   -o --output       Specify output filename.
+  --quiet           Silence all output
   --verbose         Show verbose output.
-  -n --no-download  Don't download any images or assets
+  -d --download     Download all images and assets
 """
 
 
@@ -45,27 +47,62 @@ def extract_hash(imgur_url: str):
 
 class Image:
     def __init__(self, url, descrip):
-        self._data = {"url": url, "description": descrip}
+        self._url = url
+        self._description = descrip
 
     @property
-    def url():
-        return self._data.get("url")
+    def url(self):
+        return self._url
 
     @property
-    def description():
-        return self._data.get("description")
+    def description(self):
+        return self._description
 
     def __iter__(self):
-        for key, val in self._data.items():
-            yield (key, val)
+        for key, value in {"url": self.url, "description": self.description}.items():
+            yield key, value
+
+    def __str__(self):
+        return self.url
+
+    def download(self, basename=None, quiet=False):
+        if basename is None:
+            filename = Path(os.path.basename(self.url))
+        else:
+            filename = Path(str(basename) + Path(self.url).suffix)
+
+        r = requests.get(self.url, stream=True)
+        total_size = int(r.headers.get("content-length", 0))
+        bs = 1024
+
+        progress_bar = tqdm(
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            disable=quiet,
+            desc=str(filename),
+            position=0,
+            dynamic_ncols=True,
+        )
+        with open(filename, "wb") as image:
+            for chunk in r.iter_content(chunk_size=1024):
+                image.write(chunk)
+                progress_bar.update(len(chunk))
+
+        with open(filename.with_suffix(".txt"), "w") as descrip:
+            descrip.write(self.description)
+            descrip.write("\n")
+
+        progress_bar.close()
 
 
 class Album:
-    def __init__(self, url: str, client_id: str):
+    def __init__(self, url: str, client_id: str, quiet=False):
         self.base_url = url
         self.hash = extract_hash(url)
         self.api_url = f"https://api.imgur.com/3/album/{self.hash}"
         self.client_id = client_id
+        self.quiet = quiet
 
         self._images = []
         self._get_imgur_metadata()
@@ -99,9 +136,22 @@ class Album:
         with open(filename, "wb") as f:
             f.write(json.dumps(payload, indent=4, ensure_ascii=False).encode("utf-8"))
 
-    def download_content(self, folder_path):
+    def download_content(self, folder_path=None):
+        if not folder_path:
+            folder_path = Path(self.slug_title)
+
         folder_path = Path(folder_path)
         folder_path.mkdir(exist_ok=True)
+        os.chdir(folder_path)
+
+        progress_bar = tqdm(
+            total=len(self.images), position=1, desc="Total", dynamic_ncols=True
+        )
+        for k, img in enumerate(self.images):
+            img.download(k, quiet=self.quiet)
+            progress_bar.update(1)
+
+        progress_bar.close()
 
     @property
     def title(self):
@@ -131,8 +181,11 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 arguments = docopt(CLI, version=VERSION)
-a = Album(arguments["<link>"], CLIENT_ID)
-a.dump(arguments["<filename>"])
+a = Album(arguments["<link>"], CLIENT_ID, quiet=arguments.get("--quiet"))
+
+if arguments.get("--download"):
+    a.dump()
+    a.download_content()
 
 if arguments.get("--verbose"):
     print(f"CLIENT_ID: {CLIENT_ID}")
